@@ -1,0 +1,43 @@
+name: Watch Adsterra Impressions
+
+on:
+  schedule:
+    - cron: "*/15 * * * *" # tiap 15 menit
+  workflow_dispatch:
+
+jobs:
+  watch-impressions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run impression watcher
+        env:
+          ADSTERRA_API_KEY: ${{ secrets.ADSTERRA_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: node watch_impressions.js
+
+      - name: Commit state if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if git status --porcelain | grep "last_impressions.json"; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add last_impressions.json
+            git commit -m "Update impression state [skip ci]" || echo "Nothing to commit"
+            git push
+          else
+            echo "State tidak berubah, tidak ada yang di-commit."
+          fi

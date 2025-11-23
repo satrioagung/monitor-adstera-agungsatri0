@@ -133,7 +133,7 @@ Clicks    : ${totalClk}
 Revenue   : $${totalRev.toFixed(3)}
 CPM (API) : $${totalCpm.toFixed(3)}
 CPM (calc): $${totalCpm.toFixed(3)}
-`;
+cl`;
 
         await sendTelegram(header + body + footer);
         console.log("Laporan CPM terkirim ke Telegram ✓");
