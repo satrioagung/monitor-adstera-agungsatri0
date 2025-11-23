@@ -2,7 +2,7 @@ name: Monitor Adsterra CPM
 
 on:
   schedule:
-    - cron: "0 1 * * *" # jalan tiap hari jam 01:00 UTC (08:00 WIB)
+    - cron: "0 12 * * *" # jalan tiap hari jam 12:00 UTC = 19:00 WIB
   workflow_dispatch: # bisa dijalankan manual dari tab Actions
 
 jobs:
