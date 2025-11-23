@@ -1,4 +1,5 @@
 import "dotenv/config";
+import fs from "fs/promises";
 
 const {
     ADSTERRA_API_KEY,
@@ -11,9 +12,38 @@ if (!ADSTERRA_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
     process.exit(1);
 }
 
+/* ===================== KURS USD ➜ IDR ===================== */
+async function getUsdToIdrRate() {
+    const cacheFile = "forex_cache.json";
+    const fallback = 16000; // jika API gagal
+
+    // cek cache
+    try {
+        const { date, rate } = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+        const today = new Date().toISOString().slice(0, 10);
+        if (date === today && rate > 0) return rate;
+    } catch { }
+
+    // ambil kurs API
+    try {
+        const res = await fetch("https://open.er-api.com/v6/latest/USD");
+        const data = await res.json();
+        const rate = Number(data.rates?.IDR);
+        if (rate > 0) {
+            await fs.writeFile(
+                cacheFile,
+                JSON.stringify({ date: new Date().toISOString().slice(0, 10), rate }, null, 2),
+            );
+            return rate;
+        }
+    } catch { }
+
+    return fallback;
+}
+
 const today = new Date().toISOString().slice(0, 10);
 
-// ========== AMBIL MAP ID -> ALIAS ==========
+/* ===================== AMBIL PLACEMENT (alias) ===================== */
 async function getPlacementNameMap() {
     const url = "https://api3.adsterratools.com/publisher/placements.json";
 
@@ -24,30 +54,26 @@ async function getPlacementNameMap() {
         },
     });
 
-    if (!res.ok) throw new Error(`Placements ${res.status}: ${await res.text()}`);
+    if (!res.ok) throw new Error(await res.text());
 
     const data = await res.json();
-    const list = Array.isArray(data.items) ? data.items : [];
-
     const map = {};
-    for (const p of list) {
+
+    for (const p of data.items || []) {
         const id = String(p.id);
         const alias = p.alias?.trim();
         const title = p.title?.trim();
-        const name = alias || title || `Placement ${id}`;
-        map[id] = name;
+        map[id] = alias || title || `Placement ${id}`;
     }
 
     return map;
 }
 
-// ========== AMBIL STATISTIK PER PLACEMENT ==========
+/* ===================== AMBIL STATISTIK PER PLACEMENT ===================== */
 async function getAdsterraStats() {
     const url =
         `https://api3.adsterratools.com/publisher/stats.json` +
-        `?start_date=${today}` +
-        `&finish_date=${today}` +
-        `&group_by=placement`;
+        `?start_date=${today}&finish_date=${today}&group_by=placement`;
 
     const res = await fetch(url, {
         headers: {
@@ -56,12 +82,11 @@ async function getAdsterraStats() {
         },
     });
 
-    if (!res.ok) throw new Error(`Stats ${res.status}: ${await res.text()}`);
-
+    if (!res.ok) throw new Error(await res.text());
     return await res.json();
 }
 
-// ========== KIRIM TELEGRAM ==========
+/* ===================== KIRIM TELEGRAM ===================== */
 async function sendTelegram(text) {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
@@ -75,20 +100,20 @@ async function sendTelegram(text) {
         }),
     });
 
-    const result = await res.text();
-    if (!res.ok) throw new Error(`Telegram ${res.status}: ${result}`);
+    if (!res.ok) throw new Error(await res.text());
 }
 
-// ========== MAIN ==========
+/* ===================== MAIN REPORT ===================== */
 (async () => {
     try {
+        const rate = await getUsdToIdrRate();
         const nameMap = await getPlacementNameMap();
         const stats = await getAdsterraStats();
         const items = stats.items || [];
 
-        let totalImpr = 0;
-        let totalClk = 0;
-        let totalRev = 0;
+        let totalTodayImpr = 0;
+        let totalTodayClk = 0;
+        let totalTodayRevUSD = 0;
 
         let body = "";
 
@@ -96,47 +121,44 @@ async function sendTelegram(text) {
             const id = String(row.placement);
             const name = nameMap[id] || id;
 
-            const impr = Number(row.impression || 0);
-            const clk = Number(row.clicks || 0);
-            const rev = Number(row.revenue || 0);
-            const cpmApi = Number(row.cpm || 0);
-            const cpmCalc = impr > 0 ? (1000 * rev) / impr : 0;
+            const todayImpr = Number(row.impression || 0);
+            const todayRevUSD = Number(row.revenue || 0);
+            const todayRevIDR = todayRevUSD * rate;
 
-            totalImpr += impr;
-            totalClk += clk;
-            totalRev += rev;
+            totalTodayImpr += todayImpr;
+            totalTodayClk += Number(row.clicks || 0);
+            totalTodayRevUSD += todayRevUSD;
 
             body +=
-                `nama : ${name}
-id        : ${id}
-Impression: ${impr}
-Clicks    : ${clk}
-Revenue   : $${rev.toFixed(3)}
-CPM (API) : $${cpmApi.toFixed(3)}
-CPM (calc): $${cpmCalc.toFixed(3)}
+                `👤 ${name} / ${id}
+Impression hari ini : ${todayImpr}
+Revenue hari ini    : Rp ${todayRevIDR.toLocaleString("id-ID")}
 
 `;
         }
 
-        const totalCpm = totalImpr > 0 ? (1000 * totalRev) / totalImpr : 0;
+        const totalRevIDR = totalTodayRevUSD * rate;
+        const cpmAPI = totalTodayImpr > 0 ? (1000 * totalTodayRevUSD) / totalTodayImpr : 0;
+        const cpmIDR = cpmAPI * rate;
 
         const header =
             `*Laporan CPM Adsterra (Smartlink) Agung Satrio*
 Tanggal: ${today}
+Kurs: USD → IDR = Rp ${rate.toLocaleString("id-ID")}
 
 `;
 
         const footer =
-            `total
-Impression: ${totalImpr}
-Clicks    : ${totalClk}
-Revenue   : $${totalRev.toFixed(3)}
-CPM (API) : $${totalCpm.toFixed(3)}
-CPM (calc): $${totalCpm.toFixed(3)}
-cl`;
+            `*total hari ini*
+Impression: ${totalTodayImpr}
+Clicks    : ${totalTodayClk}
+Revenue   : Rp ${totalRevIDR.toLocaleString("id-ID")}
+CPM (API) : Rp ${cpmIDR.toLocaleString("id-ID")}
+CPM (calc): Rp ${cpmIDR.toLocaleString("id-ID")}
+`;
 
         await sendTelegram(header + body + footer);
-        console.log("Laporan CPM terkirim ke Telegram ✓");
+        console.log("Laporan terkirim ✓");
     } catch (err) {
         console.error("ERROR:", err.message);
     }

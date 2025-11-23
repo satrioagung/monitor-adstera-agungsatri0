@@ -8,19 +8,46 @@ const {
 } = process.env;
 
 if (!ADSTERRA_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.error("ENV belum lengkap. Cek .env atau GitHub Secrets");
+    console.error("ENV belum lengkap. Cek .env");
     process.exit(1);
 }
 
 const STATE_FILE = "last_impressions.json";
 
+/* ======================= KURS USD ➜ IDR ======================= */
+async function getUsdToIdrRate() {
+    const cacheFile = "forex_cache.json";
+    const fallback = 16000;
+
+    // pakai cache dulu
+    try {
+        const { date, rate } = JSON.parse(await fs.readFile(cacheFile, "utf8"));
+        const today = new Date().toISOString().slice(0, 10);
+        if (date === today && rate > 0) return rate;
+    } catch { }
+
+    // ambil kurs dari API
+    try {
+        const res = await fetch("https://open.er-api.com/v6/latest/USD");
+        const data = await res.json();
+        const rate = Number(data.rates?.IDR);
+        if (rate > 0) {
+            await fs.writeFile(
+                cacheFile,
+                JSON.stringify({ date: new Date().toISOString().slice(0, 10), rate }, null, 2),
+            );
+            return rate;
+        }
+    } catch { }
+
+    return fallback;
+}
+
 function getToday() {
     return new Date().toISOString().slice(0, 10);
 }
 
-/* ============ ADSTERRA HELPERS ============ */
-
-// Map placementId -> { name, domainId }
+/* ======================= ADSTERRA HELPERS ======================= */
 async function getPlacementInfoMap() {
     const url = "https://api3.adsterratools.com/publisher/placements.json";
 
@@ -31,30 +58,23 @@ async function getPlacementInfoMap() {
         },
     });
 
-    if (!res.ok) throw new Error(`Placements ${res.status}: ${await res.text()}`);
+    if (!res.ok) throw new Error(await res.text());
 
     const data = await res.json();
-    const list = Array.isArray(data.items) ? data.items : [];
-
     const map = {};
-    for (const p of list) {
+    for (const p of data.items || []) {
         const id = String(p.id);
         const alias = p.alias?.trim();
         const title = p.title?.trim();
-        const name = alias || title || `Placement ${id}`;
-        const domainId = p.domain_id;
-        map[id] = { name, domainId };
+        map[id] = alias || title || `Placement ${id}`;
     }
     return map;
 }
 
-// Stats harian per placement (untuk cek delta impression & revenue)
 async function getStatsByPlacement(date) {
     const url =
         `https://api3.adsterratools.com/publisher/stats.json` +
-        `?start_date=${date}` +
-        `&finish_date=${date}` +
-        `&group_by=placement`;
+        `?start_date=${date}&finish_date=${date}&group_by=placement`;
 
     const res = await fetch(url, {
         headers: {
@@ -63,34 +83,22 @@ async function getStatsByPlacement(date) {
         },
     });
 
-    if (!res.ok)
-        throw new Error(`Stats(placement) ${res.status}: ${await res.text()}`);
-
+    if (!res.ok) throw new Error(await res.text());
     return await res.json();
 }
 
-/* ============ STATE HELPERS ============ */
-
-// state: { date: 'YYYY-MM-DD', placements: { [id]: { impr, rev } } }
+/* ======================= STATE HANDLING ======================= */
 async function loadState() {
     try {
-        const txt = await fs.readFile(STATE_FILE, "utf8");
-        const raw = JSON.parse(txt);
-
-        // Backward compatibility: kalau dulu cuma simpan angka
+        const obj = JSON.parse(await fs.readFile(STATE_FILE, "utf8"));
         const placements = {};
-        for (const [id, val] of Object.entries(raw.placements || {})) {
-            if (typeof val === "number") {
-                placements[id] = { impr: val, rev: 0 };
-            } else {
-                placements[id] = {
-                    impr: Number(val.impr || 0),
-                    rev: Number(val.rev || 0),
-                };
-            }
+        for (const [id, val] of Object.entries(obj.placements || {})) {
+            placements[id] = {
+                impr: Number(val.impr || 0),
+                rev: Number(val.rev || 0),
+            };
         }
-
-        return { date: raw.date || "", placements };
+        return { date: obj.date || "", placements };
     } catch {
         return { date: "", placements: {} };
     }
@@ -100,12 +108,11 @@ async function saveState(state) {
     await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-/* ============ TELEGRAM ============ */
-
+/* ======================= TELEGRAM ======================= */
 async function sendTelegram(text) {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
 
-    const res = await fetch(url, {
+    await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -114,16 +121,13 @@ async function sendTelegram(text) {
             parse_mode: "Markdown",
         }),
     });
-
-    const result = await res.text();
-    if (!res.ok) throw new Error(`Telegram ${res.status}: ${result}`);
 }
 
-/* ============ MAIN ============ */
-
+/* ======================= MAIN ======================= */
 (async () => {
     try {
         const today = getToday();
+        const rate = await getUsdToIdrRate(); // kurs otomatis
 
         const [placementMap, statsPlacement, stateOld] = await Promise.all([
             getPlacementInfoMap(),
@@ -132,62 +136,59 @@ async function sendTelegram(text) {
         ]);
 
         const items = statsPlacement.items || [];
-
-        const prevPlacements =
-            stateOld.date === today ? stateOld.placements || {} : {};
+        const prev = stateOld.date === today ? stateOld.placements : {};
 
         const newState = { date: today, placements: {} };
-
         const increased = [];
 
         for (const row of items) {
             const id = String(row.placement);
-            const info = placementMap[id] || { name: id, domainId: undefined };
+            const name = placementMap[id] || id;
 
             const impr = Number(row.impression || 0);
             const rev = Number(row.revenue || 0);
 
-            const prev = prevPlacements[id] || { impr: 0, rev: 0 };
-            const prevImpr = Number(prev.impr || 0);
-            const prevRev = Number(prev.rev || 0);
+            const prevImpr = prev[id]?.impr ?? 0;
+            const prevRev = prev[id]?.rev ?? 0;
 
             const deltaImpr = impr - prevImpr;
             const deltaRev = rev - prevRev;
 
-            // simpan state baru
             newState.placements[id] = { impr, rev };
 
             if (deltaImpr > 0 || deltaRev > 0) {
                 increased.push({
                     id,
-                    name: info.name,
+                    name,
                     deltaImpr,
-                    deltaRev,
+                    deltaRevIDR: deltaRev * rate,
                 });
             }
         }
 
         await saveState(newState);
 
+        // kalau tidak ada peningkatan
         if (increased.length === 0) {
-            console.log("Tidak ada peningkatan impression/revenue baru.");
-            process.exit(0);
+            console.log("Tidak ada peningkatan impression / revenue.");
+            return;
         }
 
+        // kirim satu pesan per placement
         for (const p of increased) {
-            const { id, name, deltaImpr, deltaRev } = p;
+            const { name, id, deltaImpr, deltaRevIDR } = p;
 
             const msg =
-                `👤: ${name}
+                `👤 ${name}
 ID Placement : ${id}
 + Impression : ${deltaImpr}
-+ Revenue    : $${deltaRev.toFixed(3)}
++ Revenue    : Rp ${deltaRevIDR.toLocaleString("id-ID")}
 `;
 
             await sendTelegram(msg);
         }
 
-        console.log("Notifikasi sederhana terkirim per-ID.");
+        console.log("Notifikasi terkirim (IDR active ✓)");
     } catch (err) {
         console.error("ERROR:", err.message);
     }
